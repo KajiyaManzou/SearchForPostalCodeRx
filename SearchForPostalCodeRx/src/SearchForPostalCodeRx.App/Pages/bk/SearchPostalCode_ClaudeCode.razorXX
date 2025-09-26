@@ -1,0 +1,208 @@
+@page "/"
+@* GetFromJsonAsync拡張メソッドに必要 *@
+@using System.Net.Http.Json
+@* DIコンテナからHttpClientを注入 *@
+@inject HttpClient Http
+@* 設定を注入 *@
+@inject IConfiguration Configuration
+@* Reactive *@
+@using System.Reactive.Linq
+@using System.Reactive.Subjects
+@using System.Reactive.Concurrency
+@using System.Reactive.Threading.Tasks
+@implements IDisposable
+
+<!--
+正しく動作しない。デバッグしない
+-->
+
+<PageTitle>郵便番号検索</PageTitle>
+
+<MudPaper Class="d-flex justify-center" Style="padding: 20px;">
+    <div class="d-flex flex-column">
+        <MudText Typo="Typo.h3" Class="mb-4">郵便番号検索</MudText>
+        <MudTextField Label="郵便番号を入力" Placeholder="例：1000001" Class="mb-4" Value="postalCode"
+            ValueChanged="@((string value) => OnPostalCodeChanged(value))" Variant="Variant.Outlined">
+        </MudTextField>
+        <MudButton Variant="Variant.Filled" Color="Color.Primary" @onclick="SearchForPostalCode">手動検索</MudButton>
+    </div>
+</MudPaper>
+
+@if (isLoading)
+{
+    <MudPaper Class="d-flex justify-center align-center" Style="padding: 40px;">
+        <MudStack AlignItems="AlignItems.Center" Spacing="3">
+            <MudProgressCircular Color="Color.Primary" Indeterminate="true" Size="Size.Large" />
+            <MudText Typo="Typo.body1" Color="Color.Primary">検索中...</MudText>
+        </MudStack>
+    </MudPaper>
+}
+else if (!string.IsNullOrEmpty(errorMessage))
+{
+    <MudAlert Severity="Severity.Error" Variant="Variant.Filled" Class="mb-4">
+        @errorMessage
+    </MudAlert>
+}
+else if (addressResult != null)
+{
+    <MudCard Elevation="3" Class="mb-4">
+        <MudStack AlignItems="AlignItems.Center" Spacing="3">
+            <MudCardHeader>
+                <CardHeaderContent>
+                    <MudText Typo="Typo.h5" Color="Color.Primary">
+                        <MudIcon Icon="Icons.Material.Filled.LocationOn" Class="mr-2" />
+                        検索結果
+                    </MudText>
+                </CardHeaderContent>
+            </MudCardHeader>
+            <MudCardContent>
+                <MudList T="string">
+                    <MudListItem T="string">
+                        <div class="d-flex flex-column">
+                            <MudText Typo="Typo.subtitle1" Color="Color.Primary">郵便番号</MudText>
+                            <MudText Typo="Typo.body1">〒@FormatPostalCode(addressResult.Zipcode ?? "")</MudText>
+                        </div>
+                    </MudListItem>
+                    <MudDivider />
+                    <MudListItem T="string">
+                        <div class="d-flex flex-column">
+                            <MudText Typo="Typo.subtitle1" Color="Color.Primary">住所</MudText>
+                            <MudText Typo="Typo.body1">
+                                @addressResult.Prefecture @addressResult.City @addressResult.Town
+                            </MudText>
+                        </div>
+                    </MudListItem>
+                    <MudDivider />
+                    <MudListItem T="string">
+                        <div class="d-flex flex-column">
+                            <MudText Typo="Typo.subtitle1" Color="Color.Primary">カナ</MudText>
+                            <MudText Typo="Typo.body1">
+                                @addressResult.PrefectureKana @addressResult.CityKana @addressResult.TownKana
+                            </MudText>
+                        </div>
+                    </MudListItem>
+                </MudList>
+            </MudCardContent>
+        </MudStack>
+    </MudCard>
+}
+
+@code {
+    private string? postalCode = "";
+    private AddressResult? addressResult;
+    private string? errorMessage;
+    private bool isLoading = false;
+
+    // リアクティブプログラミング用のSubject
+    private readonly Subject<string> _postalCodeSubject = new();
+    private IDisposable? _searchSubscription;
+
+    protected override void OnInitialized()
+    {
+        // リアクティブストリームの設定
+        _searchSubscription = _postalCodeSubject
+        .Where(code => !string.IsNullOrWhiteSpace(code)) // 空文字列をフィルタリング
+        .Where(code => code.Length >= 7) // 7桁未満をフィルタリング
+        .Throttle(TimeSpan.FromMilliseconds(500)) // 500ms のデバウンス
+        .DistinctUntilChanged() // 同じ値の連続入力を無視
+        .Do(_ =>
+        {
+            // 検索開始時の状態更新
+            isLoading = true;
+            errorMessage = null;
+            addressResult = null;
+            InvokeAsync(StateHasChanged);
+        })
+        .SelectMany(code => SearchPostalCodeAsync(code)
+        .ToObservable()
+        .Catch<(AddressResult?, string?), Exception>(ex =>
+        Observable.Return<(AddressResult?, string?)>((null, $"検索中にエラーが発生しました: {ex.Message}")))
+        )
+        .ObserveOn(SynchronizationContext.Current != null ? new SynchronizationContextScheduler(SynchronizationContext.Current)
+        : TaskPoolScheduler.Default)
+        .Subscribe(result =>
+        {
+            (addressResult, errorMessage) = result;
+            isLoading = false;
+            InvokeAsync(StateHasChanged);
+        });
+
+        base.OnInitialized();
+    }
+
+    private void OnPostalCodeChanged(string value)
+    {
+        // 入力値をリアクティブストリームに送信
+        postalCode = value;
+        _postalCodeSubject.OnNext(postalCode ?? "");
+    }
+
+    private string FormatPostalCode(string postalCode)
+    {
+        if (string.IsNullOrEmpty(postalCode) || postalCode.Length != 7) return postalCode;
+        return $"{postalCode[..3]}-{postalCode[3..]}";
+    }
+
+    private async Task<(AddressResult?, string?)> SearchPostalCodeAsync(string code)
+    {
+        try
+        {
+            // 郵便番号の形式チェック（数字のみ、7桁）
+            if (!IsValidPostalCode(code))
+            {
+                return (null, "郵便番号は7桁の数字で入力してください。");
+            }
+
+            // APIにリクエストを送信
+            var response = await Http.GetFromJsonAsync<PostalCloudResponse>(
+            $"https://zipcloud.ibsnet.co.jp/api/search?zipcode={code}");
+
+            if (response?.Status == 200 && response.Results != null && response.Results.Count > 0)
+            {
+                return (response.Results[0], null);
+            }
+            else
+            {
+                return (null, response?.Message ?? "住所が見つかりませんでした。");
+            }
+        }
+        catch (Exception ex)
+        {
+            return (null, $"検索中にエラーが発生しました: {ex.Message}");
+        }
+    }
+
+    private bool IsValidPostalCode(string code)
+    {
+        return !string.IsNullOrWhiteSpace(code) &&
+        code.Length == 7 &&
+        code.All(char.IsDigit);
+    }
+
+    // 手動検索用（従来の機能も残す）
+    private async Task SearchForPostalCode()
+    {
+        if (string.IsNullOrWhiteSpace(postalCode))
+        {
+            errorMessage = "郵便番号を入力してください。";
+            addressResult = null;
+            return;
+        }
+
+        isLoading = true;
+        errorMessage = null;
+        addressResult = null;
+        StateHasChanged();
+
+        var result = await SearchPostalCodeAsync(postalCode);
+        (addressResult, errorMessage) = result;
+        isLoading = false;
+        StateHasChanged();
+    }
+
+    public void Dispose()
+    {
+        _searchSubscription?.Dispose();
+        _postalCodeSubject?.Dispose();
+    }
+}

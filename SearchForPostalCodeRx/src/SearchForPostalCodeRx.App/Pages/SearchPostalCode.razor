@@ -1,0 +1,141 @@
+@page "/"
+@* GetFromJsonAsync拡張メソッドに必要 *@
+@using System.Net.Http.Json
+@* DIコンテナからHttpClientを注入 *@
+@inject HttpClient Http
+@* 設定を注入 *@
+@inject IConfiguration Configuration
+@* Reactive *@
+@using System.Reactive.Linq
+@using System.Reactive.Subjects
+@using System.Reactive.Concurrency
+@*
+@implements IDisposable
+*@
+
+<PageTitle>郵便番号検索</PageTitle>
+
+<MudPaper Class="d-flex justify-center" Style="padding: 20px;">
+    <div class="d-flex flex-column">
+        <MudText Typo="Typo.h3" Class="mb-4">郵便番号検索</MudText>
+
+        <!-- oninput で入力を購読 -->
+        <MudTextField Label="郵便番号を入力" Placeholder="例：1000001" Class="mb-4" Variant="Variant.Outlined"
+            Value="@postalCode" ValueChanged="@((string value) => OnPostalCodeChanged(value))" Immediate="true">
+        </MudTextField>
+        <!--
+        <MudButton Variant="Variant.Filled" Color="Color.Primary" OnClick="SearchForPostalCode">
+            検索
+        </MudButton>
+        -->
+    </div>
+</MudPaper>
+
+<MudPaper Class="d-flex justify-center" Style="padding: 20px;">
+    <div class="d-flex flex-column">
+        @if (isLoading)
+        {
+            <MudProgressCircular Indeterminate="true" Color="Color.Primary" Size="Size.Large" />
+        }
+        else if (!string.IsNullOrEmpty(errorMessage))
+        {
+            <MudAlert Severity="Severity.Error">@errorMessage</MudAlert>
+        }
+        else if (addressResult != null)
+        {
+            <MudCard>
+                <MudCardContent>
+                    <MudText Typo="Typo.body1">〒@FormatPostalCode(addressResult.Zipcode ?? "")</MudText>
+                    <MudText Typo="Typo.body1">@addressResult.Prefecture @addressResult.City @addressResult.Town</MudText>
+                </MudCardContent>
+            </MudCard>
+        }
+    </div>
+</MudPaper>
+
+@code {
+    private string? postalCode;
+    private AddressResult? addressResult;
+    private string? errorMessage;
+    private bool isLoading;
+
+    // Rx Subject
+    private readonly Subject<string> postalCodeChanged = new();
+
+    protected override void OnInitialized()
+    {
+        try
+        {
+            Console.WriteLine("**** OnInitialized ****");
+            // 入力をリアクティブに購読（0.5秒のデバウンス）
+            postalCodeChanged
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Where(code => code.Length >= 7) // 7桁の郵便番号のみを対象
+            .Throttle(TimeSpan.FromMilliseconds(500))
+            .DistinctUntilChanged()
+            .ObserveOn(SynchronizationContext.Current ?? new SynchronizationContext()) // UIスレッドで処理
+            .Subscribe(async code =>
+            {
+                await SearchForPostalCode();
+                StateHasChanged();
+            });
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"OnInitialized エラー: {ex.Message}");
+            Console.WriteLine($"スタックトレース： {ex.StackTrace}");
+        }
+    }
+
+    private void OnPostalCodeChanged(string value)
+    {
+        postalCode = value;
+        postalCodeChanged.OnNext(value);
+    }
+
+    private string FormatPostalCode(string code)
+    {
+        if (string.IsNullOrEmpty(code) || code.Length != 7) return code;
+        return $"{code[..3]}-{code[3..]}";
+    }
+
+    // 検索処理をコード指定で実行可能に変更
+    private async Task SearchForPostalCode()
+    {
+        var targetCode = postalCode;
+
+        if (string.IsNullOrWhiteSpace(targetCode))
+        {
+            errorMessage = "郵便番号を入力してください。";
+            addressResult = null;
+            return;
+        }
+
+        isLoading = true;
+        errorMessage = null;
+        addressResult = null;
+
+        try
+        {
+            var response = await Http.GetFromJsonAsync<PostalCloudResponse>(
+            $"https://zipcloud.ibsnet.co.jp/api/search?zipcode={targetCode}");
+
+            if (response?.Status == 200 && response.Results?.Count > 0)
+            {
+                addressResult = response.Results[0];
+            }
+            else
+            {
+                errorMessage = response?.Message ?? "住所が見つかりませんでした。";
+            }
+        }
+        catch (Exception ex)
+        {
+            errorMessage = $"検索中にエラーが発生しました: {ex.Message}";
+        }
+        finally
+        {
+            isLoading = false;
+        }
+    }
+}
