@@ -4,6 +4,7 @@
     <TargetFramework>net8.0</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
+    <ServiceWorkerAssetsManifest>service-worker-assets.js</ServiceWorkerAssetsManifest>
   </PropertyGroup>
 
   <ItemGroup>
@@ -17,6 +18,7 @@
     <PackageReference Include="System.Reactive.Core" Version="6.0.2" />
     <PackageReference Include="System.Reactive.Linq" Version="6.0.2" />
     <PackageReference Include="System.Text.Json" Version="9.0.9" />
+    <ServiceWorker Include="wwwroot\service-worker.js" PublishedContent="wwwroot\service-worker.js" />
   </ItemGroup>
 
 </Project>
